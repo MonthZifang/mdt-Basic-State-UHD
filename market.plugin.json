@@ -1,0 +1,22 @@
+{
+  "metadataVersion": 1,
+  "name": "mdt-basic-state-uhd",
+  "displayName": "MDT Basic State UHD",
+  "displayNameZh": "MDT 基础状态 UHD",
+  "author": "monthzifang",
+  "description": "Basic state plugin for the original Mindustry server with join popup, map vote, and status bar.",
+  "descriptionZh": "用于 Mindustry 原版服务端的基础状态插件，包含进服弹窗、换图投票与状态栏功能。",
+  "version": "v1",
+  "requiredMarketVersion": "v1",
+  "channel": "native",
+  "targets": [
+    "original"
+  ],
+  "downloadUrls": [
+    "https://raw.githubusercontent.com/MonthZifang/mdt-Basic-State-UHD/main/dist/mdt-basic-state-uhd.jar",
+    "https://raw.githubusercontent.com/MonthZifang/mdt-Basic-State-UHD/main/plugin.json"
+  ],
+  "dependencies": [],
+  "repositoryUrl": "https://github.com/MonthZifang/mdt-Basic-State-UHD",
+  "entry": "mdt.ServeMdtPlugin"
+}

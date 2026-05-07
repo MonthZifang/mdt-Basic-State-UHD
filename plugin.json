@@ -1,0 +1,7 @@
+{
+  "name": "mdt-basic-state-uhd",
+  "author": "monthzifang",
+  "main": "mdt.ServeMdtPlugin",
+  "description": "Basic state plugin for the original Mindustry server: join popup, map vote, and status bar.",
+  "version": "v1"
+}
