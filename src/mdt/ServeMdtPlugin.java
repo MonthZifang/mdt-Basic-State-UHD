@@ -12,6 +12,7 @@ import com.sun.management.OperatingSystemMXBean;
 import mindustry.Vars;
 import mindustry.game.EventType.MenuOptionChooseEvent;
 import mindustry.game.EventType.PlayerJoin;
+import mindustry.game.EventType.TextInputEvent;
 import mindustry.game.EventType.WorldLoadEvent;
 import mindustry.gen.Call;
 import mindustry.gen.Groups;
@@ -32,6 +33,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -43,12 +45,16 @@ public class ServeMdtPlugin extends Plugin{
     private static final int HELP_PAGE_SIZE = 8;
     private static final int MAP_VOTE_SELECT_MENU_BASE_ID = 910100;
     private static final int MAP_VOTE_PROMPT_MENU_ID = 910200;
+    private static final int MAP_VOTE_SEARCH_INPUT_ID = 910201;
     private static final int MAP_PAGE_SIZE = 4;
+    private static final ConcurrentHashMap<String, Object> SHARED_SERVICES = new ConcurrentHashMap<String, Object>();
 
     private final Object voteLock = new Object();
     private final ProcessCpuTracker cpuTracker = new ProcessCpuTracker();
     private final long pluginStartMillis = System.currentTimeMillis();
     private final List<HelpCommandButton> externalHelpButtons = new ArrayList<HelpCommandButton>();
+    private final ConcurrentHashMap<String, MapBrowserState> mapBrowserStates = new ConcurrentHashMap<String, MapBrowserState>();
+    private final ConcurrentHashMap<String, String> helpNotes = new ConcurrentHashMap<String, String>();
 
     private PluginConfig config;
     private VoteState activeVote;
@@ -66,12 +72,57 @@ public class ServeMdtPlugin extends Plugin{
     );
     private static final Pattern JSON_NAME_PATTERN = Pattern.compile("\"name\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"");
 
+    public static void registerSharedService(String key, Object service){
+        if(key == null){
+            return;
+        }
+        String normalized = key.trim();
+        if(normalized.isEmpty()){
+            return;
+        }
+        if(service == null){
+            SHARED_SERVICES.remove(normalized);
+            return;
+        }
+        SHARED_SERVICES.put(normalized, service);
+    }
+
+    public static void unregisterSharedService(String key){
+        if(key == null){
+            return;
+        }
+        String normalized = key.trim();
+        if(normalized.isEmpty()){
+            return;
+        }
+        SHARED_SERVICES.remove(normalized);
+    }
+
+    public static Object getSharedService(String key){
+        if(key == null){
+            return null;
+        }
+        String normalized = key.trim();
+        if(normalized.isEmpty()){
+            return null;
+        }
+        return SHARED_SERVICES.get(normalized);
+    }
+
+    public static java.util.Map<String, Object> snapshotSharedServices(){
+        return new HashMap<String, Object>(SHARED_SERVICES);
+    }
+
     @Override
     public void init(){
         reloadConfig();
 
-        Events.on(PlayerJoin.class, event -> scheduleJoinPopup(event.player));
+        Events.on(PlayerJoin.class, event -> {
+            updatePlayerProfileTimestamps(event.player);
+            scheduleJoinPopup(event.player);
+        });
         Events.on(MenuOptionChooseEvent.class, event -> handleMenuOption(event.player, event.menuId, event.option));
+        Events.on(TextInputEvent.class, event -> handleTextInput(event.player, event.textInputId, event.text));
         Events.on(WorldLoadEvent.class, event -> clearVoteState());
     }
 
@@ -86,11 +137,31 @@ public class ServeMdtPlugin extends Plugin{
             reloadExternalHelpRegistry();
             Log.info("serve-mdt external command registry reloaded. status=@ count=@", externalCommandRegistryStatus, externalHelpButtons.size());
         });
+
+        handler.register("mdt-services", "\u67e5\u770b\u5df2\u516c\u5f00\u7684 MDT \u5171\u4eab\u670d\u52a1\u3002", args -> {
+            java.util.Map<String, Object> services = snapshotSharedServices();
+            if(services.isEmpty()){
+                Log.info("MDT \u5171\u4eab\u670d\u52a1\u5217\u8868\u4e3a\u7a7a\u3002");
+                return;
+            }
+            List<String> keys = new ArrayList<String>(services.keySet());
+            Collections.sort(keys);
+            Log.info("MDT \u5171\u4eab\u670d\u52a1 @ \u9879:", keys.size());
+            for(String key : keys){
+                Object value = services.get(key);
+                Log.info("  @ -> @", key, value == null ? "<null>" : value.getClass().getName());
+            }
+        });
     }
 
     @Override
     public void registerClientCommands(CommandHandler handler){
         handler.<Player>register("help", "Open the serve-mdt help menu.", (args, player) -> {
+            if(player != null){
+                showHelpPageMenu(player, 0);
+            }
+        });
+        handler.<Player>register("帮助", "打开基础帮助菜单。", (args, player) -> {
             if(player != null){
                 showHelpPageMenu(player, 0);
             }
@@ -124,7 +195,7 @@ public class ServeMdtPlugin extends Plugin{
             }
 
             if(args.length == 0){
-                showMapVoteMenu(player, 0);
+                showMapVoteBrowser(player, 0);
                 return;
             }
 
@@ -136,7 +207,12 @@ public class ServeMdtPlugin extends Plugin{
                 }
             }
 
-            startVoteByName(player, joinArgs(args));
+            if(isMapSearchShortcut(args)){
+                openMapSearch(player, extractMapSearchQuery(args));
+                return;
+            }
+
+            openMapFromQuery(player, joinArgs(args));
         });
 
         handler.<Player>register("changemap", "<map...>", "Admin only. Change to a map immediately.", (args, player) -> {
@@ -163,8 +239,124 @@ public class ServeMdtPlugin extends Plugin{
         Fi configFile = resolveConfigFile();
         migrateLegacyConfigIfNeeded(configFile);
         config = PluginConfig.load(configFile);
+        reloadHelpNotes();
         reloadExternalHelpRegistry();
         restartStatusBarLoop();
+    }
+
+    private void reloadHelpNotes(){
+        helpNotes.clear();
+        loadHelpNotesFile(new Fi("config").child("mods").child("config").child("mdt-help-classification-strategy").child("native-help-zh.properties"));
+        loadHelpNotesFile(new Fi("config").child("mods").child("config").child("mdt-help-list-layout").child("help-list-notes-zh.properties"));
+    }
+
+    private void loadHelpNotesFile(Fi file){
+        if(file == null || !file.exists()){
+            return;
+        }
+
+        java.util.Properties properties = new java.util.Properties();
+        try(java.io.InputStreamReader reader = new java.io.InputStreamReader(new java.io.FileInputStream(file.file()), java.nio.charset.StandardCharsets.UTF_8)){
+            properties.load(reader);
+        }catch(Throwable t){
+            Log.warn("Failed to load help notes from @: @", file.absolutePath(), t.toString());
+            return;
+        }
+
+        for(String name : properties.stringPropertyNames()){
+            String key = name == null ? "" : name.trim().toLowerCase(Locale.ROOT);
+            String value = properties.getProperty(name, "").trim();
+            if(!key.isEmpty() && !value.isEmpty()){
+                helpNotes.put(key, value);
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void updatePlayerProfileTimestamps(Player player){
+        if(player == null){
+            return;
+        }
+        try{
+            String uuid = resolvePlayerUuid(player);
+            String comId = resolvePlayerComId(uuid);
+            if(uuid == null || uuid.trim().isEmpty() || comId == null || comId.trim().isEmpty()){
+                return;
+            }
+
+            Object listData = getSharedService("mdt.listdata.api");
+            if(listData == null){
+                listData = getSharedService("com.mdt.listdata.api.ListDataSystemApi");
+            }
+            if(listData == null){
+                return;
+            }
+
+            java.lang.reflect.Method getObject = listData.getClass().getMethod("getObject", String.class, String.class);
+            java.lang.reflect.Method putObject = listData.getClass().getMethod("putObject", String.class, String.class, java.util.Map.class);
+            Object current = getObject.invoke(listData, "player_profile", comId);
+            java.util.Map<String, String> values = current instanceof java.util.Map
+                ? new HashMap<String, String>((java.util.Map<String, String>)current)
+                : new HashMap<String, String>();
+
+            String now = utcNow();
+            values.put("comId", comId);
+            values.put("playerUuid", uuid);
+            values.put("playerName", displayPlayerName(player));
+            if(!values.containsKey("firstJoinAt") || values.get("firstJoinAt") == null || values.get("firstJoinAt").trim().isEmpty()){
+                values.put("firstJoinAt", now);
+            }
+            values.put("lastLoginAt", now);
+            values.put("updatedAt", now);
+            putObject.invoke(listData, "player_profile", comId, values);
+        }catch(Throwable t){
+            Log.warn("Failed to update player_profile timestamps: @", t.toString());
+        }
+    }
+
+    private String resolvePlayerUuid(Player player){
+        try{
+            return String.valueOf(player.uuid());
+        }catch(Throwable ignored){
+            try{
+                java.lang.reflect.Field field = player.getClass().getField("uuid");
+                Object value = field.get(player);
+                return value == null ? "" : value.toString();
+            }catch(Throwable t){
+                return "";
+            }
+        }
+    }
+
+    private String resolvePlayerComId(String uuid){
+        if(uuid == null || uuid.trim().isEmpty()){
+            return "";
+        }
+        try{
+            Object jumpApi = getSharedService("mdt.jump.api");
+            if(jumpApi == null){
+                jumpApi = getSharedService("com.mdt.jump.api.JumpComIdApi");
+            }
+            if(jumpApi == null){
+                return "";
+            }
+            java.lang.reflect.Method getOrCreate = jumpApi.getClass().getMethod("getOrCreate", String.class);
+            Object record = getOrCreate.invoke(jumpApi, uuid);
+            if(record == null){
+                return "";
+            }
+            java.lang.reflect.Method getComId = record.getClass().getMethod("getComId");
+            Object value = getComId.invoke(record);
+            return value == null ? "" : value.toString();
+        }catch(Throwable t){
+            return "";
+        }
+    }
+
+    private String utcNow(){
+        java.text.SimpleDateFormat format = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.ROOT);
+        format.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+        return format.format(new java.util.Date());
     }
 
     private Fi resolveConfigFile(){
@@ -298,9 +490,16 @@ public class ServeMdtPlugin extends Plugin{
                 lines.add(renderJoinPopupValue(config.joinPopup.helpText, player));
                 lines.add("");
             }
-            lines.add("[accent]点击下方按钮会直接执行支持的命令。[]");
-            lines.add("[gray]需要参数的命令会显示用法提示。[]");
+            lines.add("[accent]点击下方按钮会直接执行已接入的命令。[]");
+            lines.add("[gray]需要参数的命令会显示用途说明，说明文字会优先使用中文注释。[]");
 
+            if(page == 0){
+                String statusSummary = buildHelpStatusSummary(player);
+                if(!statusSummary.isEmpty()){
+                    lines.add(statusSummary);
+                    lines.add("");
+                }
+            }
             lines.add("[lightgray]registry: " + externalCommandRegistryStatus + "[]");
             lines.add("");
             appendHelpCommandSummaries(lines, buttons, start, end);
@@ -317,10 +516,16 @@ public class ServeMdtPlugin extends Plugin{
 
     private List<HelpCommandButton> helpCommandButtons(){
         List<HelpCommandButton> buttons = new ArrayList<HelpCommandButton>();
-        buttons.add(new HelpCommandButton("/votemap\n投票换图", "/votemap", null, null));
-        buttons.add(new HelpCommandButton("/vote\n当前投票", "/vote", null, null));
-        buttons.add(new HelpCommandButton("/kill\n清除单位", "/kill", null, null));
+        buttons.add(createBuiltInHelpButton("votemap", "<map|search>", "打开地图投票界面，可搜索地图关键词", "/votemap", "[accent]Usage:[] /votemap or /votemap <map keyword>"));
+        buttons.add(createBuiltInHelpButton("vote", "[yes/no/neutral]", "查看当前投票并参与投票", "/vote", "[accent]Usage:[] /vote or /vote yes"));
+        buttons.add(createBuiltInHelpButton("kill", "", "清除自己当前控制的单位", "/kill", null));
         return buttons;
+    }
+
+    private HelpCommandButton createBuiltInHelpButton(String command, String args, String fallbackDescription, String runText, String usageMessage){
+        String description = resolveHelpDescription(command, fallbackDescription);
+        String label = buildHelpButtonLabel(command, args, description);
+        return new HelpCommandButton(label, command, args, description, "serve-mdt", runText, usageMessage, null);
     }
 
     private List<HelpCommandButton> mergedHelpCommandButtons(){
@@ -366,16 +571,42 @@ public class ServeMdtPlugin extends Plugin{
     private HelpCommandButton createExternalHelpButton(String command, String args, String description, String source){
         String safeCommand = command == null ? "" : command.trim();
         String safeArgs = args == null ? "" : args.trim();
-        String safeDescription = description == null ? "" : description.trim();
+        String safeDescription = resolveHelpDescription(safeCommand, description == null ? "" : description.trim());
         String safeSource = source == null ? "" : source.trim();
-        String label = "/" + safeCommand;
+        String label = buildHelpButtonLabel(safeCommand, safeArgs, safeDescription);
         if(config != null && config.externalCommandRegistry != null && config.externalCommandRegistry.includePluginNameInLabel && !safeSource.isEmpty()){
-            label += "\n" + safeSource;
-        }else if(!safeDescription.isEmpty()){
-            label += "\n" + shortenLabel(safeDescription);
+            label += "\n[gray]" + safeSource + "[]";
         }
         String usageMessage = safeArgs.isEmpty() ? null : "[accent]Usage:[] /" + safeCommand + " " + safeArgs;
         return new HelpCommandButton(label, safeCommand, safeArgs, safeDescription, safeSource, "/" + safeCommand, usageMessage, null);
+    }
+
+    private String buildHelpButtonLabel(String command, String args, String description){
+        String safeCommand = command == null ? "" : command.trim();
+        String safeArgs = args == null ? "" : args.trim();
+        String safeDescription = description == null ? "" : description.trim();
+        if(safeDescription.isEmpty()){
+            return safeArgs.isEmpty() ? "/" + safeCommand : "/" + safeCommand + " " + safeArgs;
+        }
+
+        StringBuilder label = new StringBuilder(safeDescription);
+        label.append("\n[lightgray]/").append(safeCommand);
+        if(!safeArgs.isEmpty()){
+            label.append(" ").append(safeArgs);
+        }
+        label.append("[]");
+        return label.toString();
+    }
+
+    private String resolveHelpDescription(String command, String fallback){
+        String key = command == null ? "" : command.trim().toLowerCase(Locale.ROOT);
+        if(!key.isEmpty()){
+            String note = helpNotes.get(key);
+            if(note != null && !note.trim().isEmpty()){
+                return note.trim();
+            }
+        }
+        return fallback == null ? "" : fallback.trim();
     }
 
     private String shortenLabel(String value){
@@ -436,7 +667,7 @@ public class ServeMdtPlugin extends Plugin{
                     showHelpPageMenu(player, 0);
                     return;
                 case 2:
-                    showMapVoteMenu(player, 0);
+                    showMapVoteBrowser(player, 0);
                     return;
                 default:
                     return;
@@ -478,8 +709,18 @@ public class ServeMdtPlugin extends Plugin{
         }
 
         if(menuId >= MAP_VOTE_SELECT_MENU_BASE_ID && menuId < MAP_VOTE_SELECT_MENU_BASE_ID + 1000){
-            handleMapSelection(player, menuId - MAP_VOTE_SELECT_MENU_BASE_ID, option);
+            handleMapBrowserSelection(player, menuId - MAP_VOTE_SELECT_MENU_BASE_ID, option);
         }
+    }
+
+    private void handleTextInput(Player player, int textInputId, String text){
+        if(textInputId == MAP_VOTE_SEARCH_INPUT_ID){
+            handleMapVoteTextInput(player, text);
+        }
+    }
+
+    private void handleMapBrowserSelection(Player player, int page, int option){
+        handleMapSelection(player, page, option);
     }
 
     private void handleHelpPageChoice(Player player, int menuId, int option){
@@ -591,14 +832,14 @@ public class ServeMdtPlugin extends Plugin{
         List<Map> pageMaps = maps.subList(start, end);
 
         StringBuilder message = new StringBuilder();
-        message.append("[accent]投票换图[]\n");
+        message.append("[accent]地图投票[]\n");
         message.append("当前地图: [white]").append(currentMapName()).append("[]\n");
-        message.append("第 [white]").append(currentPage + 1).append("/").append(totalPages).append("[] 页，选择一张地图发起投票。");
+        message.append("第 [white]").append(currentPage + 1).append("/").append(totalPages).append("[] 页，选择一张地图发起投票，或点击搜索地图。");
 
         Call.menu(
             player.con,
             MAP_VOTE_SELECT_MENU_BASE_ID + currentPage,
-            "[accent]投票换图[]",
+            "[accent]地图投票[]",
             message.toString(),
             buildMapSelectionOptions(player, pageMaps, currentPage, totalPages)
         );
@@ -616,16 +857,8 @@ public class ServeMdtPlugin extends Plugin{
             rows.add(row);
         }
 
-        List<String> nav = new ArrayList<String>();
-        if(page > 0){
-            nav.add("上一页");
-        }
-        if(page + 1 < totalPages){
-            nav.add("下一页");
-        }
-        if(!nav.isEmpty()){
-            rows.add(nav.toArray(new String[0]));
-        }
+        rows.add(new String[]{"搜索地图"});
+        rows.add(new String[]{page > 0 ? "上一页" : "[gray]上一页[]", page + 1 < totalPages ? "下一页" : "[gray]下一页[]"});
 
         if(player != null && player.admin()){
             rows.add(new String[]{"下一张地图"});
@@ -664,36 +897,35 @@ public class ServeMdtPlugin extends Plugin{
         }
 
         option -= pageMaps.size();
-
-        int extraIndex = 0;
-        if(currentPage > 0){
-            if(option == extraIndex){
-                showMapVoteMenu(player, currentPage - 1);
-                return;
-            }
-            extraIndex++;
+        if(option == 0){
+            openMapSearch(player, "");
+            return;
         }
+        option -= 1;
 
-        if(currentPage + 1 < totalPages){
-            if(option == extraIndex){
-                showMapVoteMenu(player, currentPage + 1);
-                return;
-            }
-            extraIndex++;
+        if(option == 0 && currentPage > 0){
+            showMapVoteMenu(player, currentPage - 1);
+            return;
         }
+        option -= 1;
+
+        if(option == 0 && currentPage + 1 < totalPages){
+            showMapVoteMenu(player, currentPage + 1);
+            return;
+        }
+        option -= 1;
 
         if(player != null && player.admin()){
-            if(option == extraIndex){
+            if(option == 0){
                 changeToNextMap(player);
                 return;
             }
-            extraIndex++;
+            option -= 1;
         }
 
         String link = normalizeUrl(config.mapVote.homeLinkUrl);
-        if(!link.isEmpty() && option == extraIndex){
+        if(!link.isEmpty() && option == 0){
             Call.openURI(player.con, link);
-            return;
         }
     }
 
@@ -710,6 +942,273 @@ public class ServeMdtPlugin extends Plugin{
 
         Call.sendMessage("[accent]" + displayPlayerName(player) + "[] 正在切换到下一张地图: [white]" + next.plainName() + "[]");
         loadMap(next);
+    }
+
+    private void showMapVoteBrowser(Player player, int page){
+        if(player == null || player.con == null){
+            return;
+        }
+
+        ExternalVoteSession external = getExternalVoteSession();
+        if(external != null){
+            showExternalVoteMenu(player, external);
+            return;
+        }
+
+        VoteStatus active = getVoteStatus();
+        if(active != null){
+            showActiveVoteMenu(player, active);
+            return;
+        }
+
+        List<Map> maps = availableMaps();
+        if(maps.isEmpty()){
+            player.sendMessage("[scarlet]当前没有可投票的地图。[]");
+            return;
+        }
+
+        int totalPages = Math.max((maps.size() + MAP_PAGE_SIZE - 1) / MAP_PAGE_SIZE, 1);
+        int currentPage = clampPage(page, totalPages);
+        MapBrowserState state = new MapBrowserState(currentPage, totalPages, maps);
+        mapBrowserStates.put(player.uuid(), state);
+
+        Call.textInput(
+            player.con,
+            MAP_VOTE_SEARCH_INPUT_ID,
+            "[accent]地图搜索[]",
+            buildMapVoteBrowserMessage(player, state),
+            64,
+            state.pendingInput,
+            false
+        );
+    }
+
+    private String buildMapVoteBrowserMessage(Player player, MapBrowserState state){
+        List<Map> pageMaps = state.pageMaps();
+        StringBuilder message = new StringBuilder();
+        message.append("[accent]地图搜索[]\n");
+        message.append("当前地图: [white]").append(currentMapName()).append("[]\n");
+        message.append("第 [white]").append(state.page + 1).append("/").append(state.totalPages).append("[] 页\n");
+        message.append("输入页内编号、完整地图名，或输入: [white]next prev open close");
+        if(player != null && player.admin()){
+            message.append(" cycle");
+        }
+        message.append("[]\n");
+        message.append("本页地图:\n");
+
+        for(int i = 0; i < pageMaps.size(); i++){
+            message.append("[accent]").append(i + 1).append(".[] [white]").append(pageMaps.get(i).plainName()).append("[]\n");
+        }
+
+        String link = normalizeUrl(config.mapVote.homeLinkUrl);
+        if(!link.isEmpty()){
+            String label = config.mapVote.homeLinkLabel == null ? "" : config.mapVote.homeLinkLabel.trim();
+            if(label.isEmpty()){
+                label = "资源站";
+            }
+            message.append("输入 [white]open[] 打开: [white]").append(label).append("[]\n");
+        }
+
+        return message.toString().trim();
+    }
+
+    private void handleMapVoteTextInput(Player player, String text){
+        if(player == null){
+            return;
+        }
+
+        String input = text == null ? "" : text.trim();
+        MapBrowserState state = mapBrowserStates.get(player.uuid());
+        if(state == null){
+            showMapVoteBrowser(player, 0);
+            return;
+        }
+
+        state.pendingInput = input;
+        if(input.isEmpty()){
+            showMapVoteBrowser(player, state.page);
+            return;
+        }
+
+        String normalized = input.toLowerCase(Locale.ROOT);
+        if("close".equals(normalized) || "cancel".equals(normalized)){
+            mapBrowserStates.remove(player.uuid());
+            player.sendMessage("[accent]已关闭地图搜索。[]");
+            return;
+        }
+
+        if("next".equals(normalized) || ">".equals(normalized)){
+            showMapVoteBrowser(player, state.page + 1);
+            return;
+        }
+
+        if("prev".equals(normalized) || "previous".equals(normalized) || "<".equals(normalized)){
+            showMapVoteBrowser(player, state.page - 1);
+            return;
+        }
+
+        if("open".equals(normalized) || "link".equals(normalized)){
+            String link = normalizeUrl(config.mapVote.homeLinkUrl);
+            if(link.isEmpty()){
+                player.sendMessage("[scarlet]当前没有配置地图资源站链接。[]");
+            }else if(player.con != null){
+                Call.openURI(player.con, link);
+            }
+            showMapVoteBrowser(player, state.page);
+            return;
+        }
+
+        if(player.admin() && ("cycle".equals(normalized) || "nextmap".equals(normalized))){
+            mapBrowserStates.remove(player.uuid());
+            changeToNextMap(player);
+            return;
+        }
+
+        List<Map> pageMaps = state.pageMaps();
+        Integer selectedIndex = parsePositiveInt(normalized);
+        if(selectedIndex != null){
+            int pageIndex = selectedIndex - 1;
+            if(pageIndex >= 0 && pageIndex < pageMaps.size()){
+                mapBrowserStates.remove(player.uuid());
+                startVote(player, pageMaps.get(pageIndex));
+                return;
+            }
+
+            player.sendMessage("[scarlet]这个编号不在当前页范围内。[]");
+            showMapVoteBrowser(player, state.page);
+            return;
+        }
+
+        Map exact = findMap(input);
+        if(exact != null){
+            mapBrowserStates.remove(player.uuid());
+            startVote(player, exact);
+            return;
+        }
+
+        player.sendMessage("[scarlet]没有找到地图，请输入页内编号或完整地图名。[]");
+        showMapVoteBrowser(player, state.page);
+    }
+
+    private Integer parsePositiveInt(String value){
+        try{
+            int parsed = Integer.parseInt(value);
+            return parsed > 0 ? parsed : null;
+        }catch(NumberFormatException ignored){
+            return null;
+        }
+    }
+
+    private boolean isMapSearchShortcut(String[] args){
+        if(args == null || args.length == 0){
+            return false;
+        }
+
+        String first = args[0] == null ? "" : args[0].trim().toLowerCase(Locale.ROOT);
+        return "search".equals(first) || "find".equals(first) || "s".equals(first);
+    }
+
+    private String extractMapSearchQuery(String[] args){
+        if(args == null || args.length <= 1){
+            return "";
+        }
+        return joinArgs(args, 1);
+    }
+
+    private String joinArgs(String[] args, int startIndex){
+        if(args == null || startIndex >= args.length){
+            return "";
+        }
+
+        StringBuilder builder = new StringBuilder();
+        for(int i = Math.max(startIndex, 0); i < args.length; i++){
+            String part = args[i];
+            if(part == null || part.trim().isEmpty()){
+                continue;
+            }
+            if(builder.length() > 0){
+                builder.append(' ');
+            }
+            builder.append(part.trim());
+        }
+        return builder.toString();
+    }
+
+    private void openMapSearch(Player player, String query){
+        if(player == null){
+            return;
+        }
+
+        String normalized = query == null ? "" : query.trim();
+        if(normalized.isEmpty()){
+            showMapVoteBrowser(player, 0);
+            return;
+        }
+
+        List<Map> matches = searchMaps(normalized);
+        if(matches.isEmpty()){
+            player.sendMessage("[scarlet]没有匹配到地图:[] " + normalized);
+            showMapVoteBrowser(player, 0);
+            return;
+        }
+
+        if(matches.size() == 1){
+            startVote(player, matches.get(0));
+            return;
+        }
+
+        int totalPages = Math.max((matches.size() + MAP_PAGE_SIZE - 1) / MAP_PAGE_SIZE, 1);
+        MapBrowserState state = new MapBrowserState(0, totalPages, matches);
+        state.pendingInput = normalized;
+        mapBrowserStates.put(player.uuid(), state);
+
+        Call.textInput(
+            player.con,
+            MAP_VOTE_SEARCH_INPUT_ID,
+            "[accent]地图搜索[]",
+            buildMapVoteBrowserMessage(player, state),
+            64,
+            state.pendingInput,
+            false
+        );
+    }
+
+    private void openMapFromQuery(Player player, String query){
+        if(player == null){
+            return;
+        }
+
+        String normalized = query == null ? "" : query.trim();
+        if(normalized.isEmpty()){
+            showMapVoteBrowser(player, 0);
+            return;
+        }
+
+        Map exact = findMap(normalized);
+        if(exact != null){
+            startVote(player, exact);
+            return;
+        }
+
+        openMapSearch(player, normalized);
+    }
+
+    private List<Map> searchMaps(String query){
+        List<Map> maps = availableMaps();
+        if(query == null || query.trim().isEmpty()){
+            return maps;
+        }
+
+        String normalized = query.trim().toLowerCase(Locale.ROOT);
+        List<Map> matches = new ArrayList<Map>();
+        for(Map map : maps){
+            String plain = map.plainName();
+            String name = map.name() == null ? "" : map.name();
+            if(plain.toLowerCase(Locale.ROOT).contains(normalized) || name.toLowerCase(Locale.ROOT).contains(normalized)){
+                matches.add(map);
+            }
+        }
+        return matches;
     }
 
     private void startVoteByName(Player player, String mapName){
@@ -1133,6 +1632,7 @@ public class ServeMdtPlugin extends Plugin{
             return "";
         }
 
+        PlayerStatusSnapshot status = snapshotPlayerStatus(player);
         return value
             .replace("{server_name}", currentServerName())
             .replace("{cpu_percent}", formatStatusBarFloat(cpuPercent))
@@ -1141,9 +1641,170 @@ public class ServeMdtPlugin extends Plugin{
             .replace("{current_map}", currentMapName())
             .replace("{game_time}", currentGameTime())
             .replace("{player_name}", currentPlayerName(player))
+            .replace("{bind_state}", status.bound ? "true" : "false")
+            .replace("{bind_status_text}", status.bound ? "已绑定" : "未绑定")
+            .replace("{qq_number}", status.qqNumber)
+            .replace("{permission_group}", status.permissionGroupDisplay)
+            .replace("{permission_group_id}", status.permissionGroupId)
             .replace("{qq_group}", config.statusBar.qqGroupText == null ? "" : config.statusBar.qqGroupText.trim())
             .replace("{message}", config.statusBar.customMessageText == null ? "" : config.statusBar.customMessageText.trim())
             .replace("{uptime}", formatStatusBarDuration((System.currentTimeMillis() - pluginStartMillis) / 1000L));
+    }
+
+    private String buildHelpStatusSummary(Player player){
+        if(player == null){
+            return "";
+        }
+
+        PlayerStatusSnapshot status = snapshotPlayerStatus(player);
+        String bindText = status.bound ? "已绑定" : "未绑定";
+        String groupText = status.permissionGroupDisplay == null || status.permissionGroupDisplay.trim().isEmpty()
+            ? (status.permissionGroupId == null ? "" : status.permissionGroupId.trim())
+            : status.permissionGroupDisplay.trim();
+        if(groupText.isEmpty()){
+            groupText = "未分组";
+        }
+
+        StringBuilder builder = new StringBuilder("[accent]当前状态[] ");
+        builder.append("[white]绑定: ").append(bindText).append("[]");
+        builder.append(" [lightgray]|[] [white]权限组: ").append(groupText).append("[]");
+        if(status.qqNumber != null && !status.qqNumber.trim().isEmpty()){
+            builder.append(" [lightgray]|[] [white]QQ: ").append(status.qqNumber.trim()).append("[]");
+        }
+        return builder.toString();
+    }
+
+    @SuppressWarnings("unchecked")
+    private PlayerStatusSnapshot snapshotPlayerStatus(Player player){
+        PlayerStatusSnapshot snapshot = new PlayerStatusSnapshot();
+        if(player == null){
+            return snapshot;
+        }
+
+        try{
+            String uuid = resolvePlayerUuid(player);
+            String comId = resolvePlayerComId(uuid);
+            snapshot.permissionGroupId = resolvePermissionGroupId(player);
+            snapshot.permissionGroupDisplay = resolvePermissionGroupDisplay(player, snapshot.permissionGroupId);
+
+            Object listData = getSharedService("mdt.listdata.api");
+            if(listData == null){
+                listData = getSharedService("com.mdt.listdata.api.ListDataSystemApi");
+            }
+            if(listData == null){
+                return snapshot;
+            }
+
+            java.lang.reflect.Method getObject = listData.getClass().getMethod("getObject", String.class, String.class);
+            java.util.Map<String, String> bindObject = null;
+            java.util.Map<String, String> profileObject = null;
+
+            if(comId != null && !comId.trim().isEmpty()){
+                Object bindCurrent = getObject.invoke(listData, "player_bind", comId);
+                if(bindCurrent instanceof java.util.Map){
+                    bindObject = new HashMap<String, String>((java.util.Map<String, String>)bindCurrent);
+                }
+                Object profileCurrent = getObject.invoke(listData, "player_profile", comId);
+                if(profileCurrent instanceof java.util.Map){
+                    profileObject = new HashMap<String, String>((java.util.Map<String, String>)profileCurrent);
+                }
+            }
+
+            if((profileObject == null || profileObject.isEmpty()) && uuid != null && !uuid.trim().isEmpty()){
+                Object profileByUuid = getObject.invoke(listData, "player_profile", uuid);
+                if(profileByUuid instanceof java.util.Map){
+                    profileObject = new HashMap<String, String>((java.util.Map<String, String>)profileByUuid);
+                }
+            }
+
+            snapshot.qqNumber = firstNonBlank(
+                readValue(bindObject, "qqNumber", "qq", "qq_id"),
+                readValue(profileObject, "qqNumber", "qq", "qq_id"),
+                ""
+            );
+
+            String boundRaw = firstNonBlank(
+                readValue(bindObject, "bound", "isBound"),
+                readValue(profileObject, "bound", "isBound"),
+                ""
+            );
+            snapshot.bound = "true".equalsIgnoreCase(boundRaw) || !snapshot.qqNumber.isEmpty();
+        }catch(Throwable ignored){
+            // Ignore status placeholder lookup failures and keep graceful fallbacks.
+        }
+
+        return snapshot;
+    }
+
+    private String resolvePermissionGroupId(Player player){
+        try{
+            Class<?> registryClass = Class.forName("com.mdt.permission.PermissionGroupRegistry");
+            java.lang.reflect.Method get = registryClass.getMethod("get");
+            Object service = get.invoke(null);
+            if(service == null){
+                return player != null && player.admin() ? "root" : "";
+            }
+            java.lang.reflect.Method method = service.getClass().getMethod("getResolvedGroupId", Player.class);
+            Object value = method.invoke(service, player);
+            return value == null ? "" : value.toString().trim();
+        }catch(Throwable ignored){
+            return player != null && player.admin() ? "root" : "";
+        }
+    }
+
+    private String resolvePermissionGroupDisplay(Player player, String fallbackId){
+        try{
+            Class<?> registryClass = Class.forName("com.mdt.permission.PermissionGroupRegistry");
+            java.lang.reflect.Method get = registryClass.getMethod("get");
+            Object service = get.invoke(null);
+            if(service == null){
+                return fallbackPermissionDisplay(player, fallbackId);
+            }
+            java.lang.reflect.Method method = service.getClass().getMethod("getResolvedGroupDisplayName", Player.class);
+            Object value = method.invoke(service, player);
+            String resolved = value == null ? "" : value.toString().trim();
+            return resolved.isEmpty() ? fallbackPermissionDisplay(player, fallbackId) : resolved;
+        }catch(Throwable ignored){
+            return fallbackPermissionDisplay(player, fallbackId);
+        }
+    }
+
+    private String fallbackPermissionDisplay(Player player, String fallbackId){
+        if(fallbackId != null && !fallbackId.trim().isEmpty()){
+            return fallbackId.trim();
+        }
+        if(player != null && player.admin()){
+            return "??";
+        }
+        return "";
+    }
+
+    private String readValue(java.util.Map<String, String> values, String... keys){
+        if(values == null || values.isEmpty() || keys == null){
+            return "";
+        }
+        for(String key : keys){
+            if(key == null){
+                continue;
+            }
+            String current = values.get(key);
+            if(current != null && !current.trim().isEmpty()){
+                return current.trim();
+            }
+        }
+        return "";
+    }
+
+    private String firstNonBlank(String... values){
+        if(values == null){
+            return "";
+        }
+        for(String current : values){
+            if(current != null && !current.trim().isEmpty()){
+                return current.trim();
+            }
+        }
+        return "";
     }
 
     private int realPlayerCount(){
@@ -1672,6 +2333,35 @@ public class ServeMdtPlugin extends Plugin{
             this.message = message;
             this.buttons = buttons;
         }
+    }
+
+    private static class MapBrowserState{
+        final int page;
+        final int totalPages;
+        final List<Map> maps;
+        String pendingInput = "";
+
+        MapBrowserState(int page, int totalPages, List<Map> maps){
+            this.page = page;
+            this.totalPages = totalPages;
+            this.maps = new ArrayList<Map>(maps);
+        }
+
+        List<Map> pageMaps(){
+            int start = Math.max(page, 0) * MAP_PAGE_SIZE;
+            int end = Math.min(start + MAP_PAGE_SIZE, maps.size());
+            if(start >= end){
+                return Collections.emptyList();
+            }
+            return maps.subList(start, end);
+        }
+    }
+
+    private static class PlayerStatusSnapshot{
+        boolean bound;
+        String qqNumber = "";
+        String permissionGroupId = "";
+        String permissionGroupDisplay = "";
     }
 
     private static class HelpCommandButton{

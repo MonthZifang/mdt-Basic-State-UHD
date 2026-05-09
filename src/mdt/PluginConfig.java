@@ -294,7 +294,7 @@ public class PluginConfig{
         public String qqGroupFormat = "[green]QQ群: [white]{qq_group}[]";
         public boolean customMessageEnabled = true;
         public String customMessageText = "这是一个重构项目，欢迎加入测试。";
-        public String customMessageFormat = "[gold]{message}[]";
+        public String customMessageFormat = "[gold]{message}[] [lightgray]QQ:{qq_number}[]";
 
         public void sanitize(){
             refreshIntervalSec = Math.max(refreshIntervalSec, 1);
