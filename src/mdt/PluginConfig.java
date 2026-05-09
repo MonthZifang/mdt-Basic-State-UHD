@@ -9,6 +9,7 @@ public class PluginConfig{
     public JoinPopup joinPopup = new JoinPopup();
     public MapVote mapVote = new MapVote();
     public StatusBar statusBar = new StatusBar();
+    public ExternalCommandRegistry externalCommandRegistry = new ExternalCommandRegistry();
 
     public static PluginConfig load(Fi file){
         PluginConfig defaults = new PluginConfig();
@@ -66,7 +67,10 @@ public class PluginConfig{
             || !value.contains("homeLinkUrl")
             || !value.contains("homeLinkLabel")
             || !value.contains("refreshIntervalSec")
-            || !value.contains("serverNameFormat");
+            || !value.contains("serverNameFormat")
+            || !value.contains("externalCommandRegistry")
+            || !value.contains("pluginsRootPath")
+            || !value.contains("includePluginNameInLabel");
     }
 
     private static void writeExpandedConfig(Fi file, PluginConfig config){
@@ -100,6 +104,12 @@ public class PluginConfig{
         appendInt(out, "left", cfg.mapVote.left, 2, true);
         appendInt(out, "bottom", cfg.mapVote.bottom, 2, true);
         appendInt(out, "right", cfg.mapVote.right, 2, false);
+        out.append("  },\n");
+
+        out.append("  \"externalCommandRegistry\": {\n");
+        appendBoolean(out, "enabled", cfg.externalCommandRegistry.enabled, 2, true);
+        appendString(out, "pluginsRootPath", cfg.externalCommandRegistry.pluginsRootPath, 2, true);
+        appendBoolean(out, "includePluginNameInLabel", cfg.externalCommandRegistry.includePluginNameInLabel, 2, false);
         out.append("  },\n");
 
         out.append("  \"statusBar\": {\n");
@@ -183,9 +193,13 @@ public class PluginConfig{
         if(statusBar == null){
             statusBar = new StatusBar();
         }
+        if(externalCommandRegistry == null){
+            externalCommandRegistry = new ExternalCommandRegistry();
+        }
 
         joinPopup.sanitize();
         mapVote.sanitize();
+        externalCommandRegistry.sanitize();
         statusBar.sanitize();
     }
 
@@ -238,6 +252,16 @@ public class PluginConfig{
             homeLinkUrl = safe(homeLinkUrl, "");
             homeLinkLabel = safe(homeLinkLabel, "WZ资源站");
             align = safe(align, "top_left");
+        }
+    }
+
+    public static class ExternalCommandRegistry{
+        public boolean enabled = true;
+        public String pluginsRootPath = "C:/Users/43551/Desktop/mdt-Plugin/plugins";
+        public boolean includePluginNameInLabel = true;
+
+        public void sanitize(){
+            pluginsRootPath = safe(pluginsRootPath, "C:/Users/43551/Desktop/mdt-Plugin/plugins");
         }
     }
 

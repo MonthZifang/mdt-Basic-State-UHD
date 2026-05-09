@@ -27,9 +27,13 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map.Entry;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class ServeMdtPlugin extends Plugin{
     private static final String PLUGIN_NAME = "mdt-basic-state-uhd";
@@ -44,6 +48,7 @@ public class ServeMdtPlugin extends Plugin{
     private final Object voteLock = new Object();
     private final ProcessCpuTracker cpuTracker = new ProcessCpuTracker();
     private final long pluginStartMillis = System.currentTimeMillis();
+    private final List<HelpCommandButton> externalHelpButtons = new ArrayList<HelpCommandButton>();
 
     private PluginConfig config;
     private VoteState activeVote;
@@ -51,6 +56,15 @@ public class ServeMdtPlugin extends Plugin{
     private Timer.Task voteHudTask;
     private Timer.Task statusBarTask;
     private int voteSequence;
+    private String externalCommandRegistryStatus = "not-loaded";
+
+    private static final Pattern REGISTER_WITH_USAGE_PATTERN = Pattern.compile(
+        "handler\\s*\\.\\s*<Player>register\\(\\s*\"((?:\\\\.|[^\"\\\\])*)\"\\s*,\\s*\"((?:\\\\.|[^\"\\\\])*)\"\\s*,\\s*\"((?:\\\\.|[^\"\\\\])*)\"\\s*,"
+    );
+    private static final Pattern REGISTER_NO_USAGE_PATTERN = Pattern.compile(
+        "handler\\s*\\.\\s*<Player>register\\(\\s*\"((?:\\\\.|[^\"\\\\])*)\"\\s*,\\s*\"((?:\\\\.|[^\"\\\\])*)\"\\s*,"
+    );
+    private static final Pattern JSON_NAME_PATTERN = Pattern.compile("\"name\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"");
 
     @Override
     public void init(){
@@ -66,6 +80,11 @@ public class ServeMdtPlugin extends Plugin{
         handler.register("mdtreload", "Reload serve-mdt plugin config from disk.", args -> {
             reloadConfig();
             Log.info("serve-mdt plugin config reloaded.");
+        });
+
+        handler.register("mdtregister", "Reload external help command registry.", args -> {
+            reloadExternalHelpRegistry();
+            Log.info("serve-mdt external command registry reloaded. status=@ count=@", externalCommandRegistryStatus, externalHelpButtons.size());
         });
     }
 
@@ -144,6 +163,7 @@ public class ServeMdtPlugin extends Plugin{
         Fi configFile = resolveConfigFile();
         migrateLegacyConfigIfNeeded(configFile);
         config = PluginConfig.load(configFile);
+        reloadExternalHelpRegistry();
         restartStatusBarLoop();
     }
 
@@ -265,7 +285,7 @@ public class ServeMdtPlugin extends Plugin{
     }
 
     private List<HelpPage> helpPages(Player player){
-        List<HelpCommandButton> buttons = helpCommandButtons();
+        List<HelpCommandButton> buttons = mergedHelpCommandButtons();
         int totalPages = Math.max((buttons.size() + HELP_PAGE_SIZE - 1) / HELP_PAGE_SIZE, 1);
         List<HelpPage> pages = new ArrayList<HelpPage>(totalPages);
 
@@ -280,6 +300,10 @@ public class ServeMdtPlugin extends Plugin{
             }
             lines.add("[accent]点击下方按钮会直接执行支持的命令。[]");
             lines.add("[gray]需要参数的命令会显示用法提示。[]");
+
+            lines.add("[lightgray]registry: " + externalCommandRegistryStatus + "[]");
+            lines.add("");
+            appendHelpCommandSummaries(lines, buttons, start, end);
 
             pages.add(new HelpPage(
                 "[accent]帮助 " + (page + 1) + "/" + totalPages + "[]",
@@ -297,6 +321,69 @@ public class ServeMdtPlugin extends Plugin{
         buttons.add(new HelpCommandButton("/vote\n当前投票", "/vote", null, null));
         buttons.add(new HelpCommandButton("/kill\n清除单位", "/kill", null, null));
         return buttons;
+    }
+
+    private List<HelpCommandButton> mergedHelpCommandButtons(){
+        List<HelpCommandButton> buttons = new ArrayList<HelpCommandButton>(helpCommandButtons());
+        synchronized(externalHelpButtons){
+            for(HelpCommandButton button : externalHelpButtons){
+                if(!containsCommand(buttons, button.command)){
+                    buttons.add(button);
+                }
+            }
+        }
+        Collections.sort(buttons, Comparator.comparing(button -> button.command.toLowerCase(Locale.ROOT)));
+        return buttons;
+    }
+
+    private boolean containsCommand(List<HelpCommandButton> buttons, String command){
+        for(HelpCommandButton button : buttons){
+            if(button.command.equalsIgnoreCase(command)){
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void appendHelpCommandSummaries(List<String> lines, List<HelpCommandButton> buttons, int start, int end){
+        for(int idx = start; idx < end; idx++){
+            HelpCommandButton button = buttons.get(idx);
+            StringBuilder line = new StringBuilder();
+            line.append("[accent]/").append(button.command).append("[]");
+            if(button.args != null && !button.args.isEmpty()){
+                line.append(" [lightgray]").append(button.args).append("[]");
+            }
+            if(button.description != null && !button.description.isEmpty()){
+                line.append(" - ").append(button.description);
+            }
+            if(button.source != null && !button.source.isEmpty()){
+                line.append(" [gray](").append(button.source).append(")[]");
+            }
+            lines.add(line.toString());
+        }
+    }
+
+    private HelpCommandButton createExternalHelpButton(String command, String args, String description, String source){
+        String safeCommand = command == null ? "" : command.trim();
+        String safeArgs = args == null ? "" : args.trim();
+        String safeDescription = description == null ? "" : description.trim();
+        String safeSource = source == null ? "" : source.trim();
+        String label = "/" + safeCommand;
+        if(config != null && config.externalCommandRegistry != null && config.externalCommandRegistry.includePluginNameInLabel && !safeSource.isEmpty()){
+            label += "\n" + safeSource;
+        }else if(!safeDescription.isEmpty()){
+            label += "\n" + shortenLabel(safeDescription);
+        }
+        String usageMessage = safeArgs.isEmpty() ? null : "[accent]Usage:[] /" + safeCommand + " " + safeArgs;
+        return new HelpCommandButton(label, safeCommand, safeArgs, safeDescription, safeSource, "/" + safeCommand, usageMessage, null);
+    }
+
+    private String shortenLabel(String value){
+        String safe = value == null ? "" : value.trim();
+        if(safe.length() <= 12){
+            return safe;
+        }
+        return safe.substring(0, 12);
     }
 
     private String[][] buildHelpPageOptions(HelpPage page, int index, int totalPages){
@@ -362,6 +449,19 @@ public class ServeMdtPlugin extends Plugin{
         }
 
         if(menuId == MAP_VOTE_PROMPT_MENU_ID){
+            ExternalVoteSession external = getExternalVoteSession();
+            if(external != null){
+                switch(option){
+                    case 0:
+                        castExternalVote(player, (byte)1, external);
+                        return;
+                    case 1:
+                        castExternalVote(player, (byte)-1, external);
+                        return;
+                    default:
+                        return;
+                }
+            }
             switch(option){
                 case 0:
                     castVote(player, (byte)1);
@@ -463,6 +563,12 @@ public class ServeMdtPlugin extends Plugin{
 
     private void showMapVoteMenu(Player player, int page){
         if(player == null || player.con == null){
+            return;
+        }
+
+        ExternalVoteSession external = getExternalVoteSession();
+        if(external != null){
+            showExternalVoteMenu(player, external);
             return;
         }
 
@@ -621,6 +727,13 @@ public class ServeMdtPlugin extends Plugin{
             return;
         }
 
+        ExternalVoteSession external = getExternalVoteSession();
+        if(external != null){
+            showExternalVoteMenu(player, external);
+            player.sendMessage("[scarlet]Another external vote session is already active.[]");
+            return;
+        }
+
         VoteStatus startedStatus = null;
         VoteDecision immediateDecision = VoteDecision.Pending;
 
@@ -669,6 +782,12 @@ public class ServeMdtPlugin extends Plugin{
     }
 
     private void castVote(Player player, byte choice){
+        ExternalVoteSession external = getExternalVoteSession();
+        if(external != null){
+            castExternalVote(player, choice, external);
+            return;
+        }
+
         VoteStatus current;
         VoteDecision decision;
 
@@ -701,6 +820,12 @@ public class ServeMdtPlugin extends Plugin{
 
     private void showActiveVoteMenu(Player player, VoteStatus status){
         if(player == null || player.con == null){
+            return;
+        }
+
+        ExternalVoteSession external = getExternalVoteSession();
+        if(external != null){
+            showExternalVoteMenu(player, external);
             return;
         }
 
@@ -1203,6 +1328,243 @@ public class ServeMdtPlugin extends Plugin{
         return "https://" + value;
     }
 
+    private void reloadExternalHelpRegistry(){
+        List<HelpCommandButton> loaded = new ArrayList<HelpCommandButton>();
+        String status = "disabled";
+
+        try{
+            if(config != null && config.externalCommandRegistry != null && config.externalCommandRegistry.enabled){
+                Fi root = new Fi(config.externalCommandRegistry.pluginsRootPath);
+                if(!root.exists() || !root.isDirectory()){
+                    status = "missing-root";
+                }else{
+                    Set<String> seen = new LinkedHashSet<String>();
+                    int pluginCount = 0;
+                    for(Fi pluginDir : root.list()){
+                        if(pluginDir == null || !pluginDir.isDirectory()){
+                            continue;
+                        }
+
+                        Fi srcRoot = pluginDir.child("src").child("main").child("java");
+                        if(!srcRoot.exists() || !srcRoot.isDirectory()){
+                            continue;
+                        }
+
+                        pluginCount++;
+                        String pluginName = loadPluginDisplayName(pluginDir);
+                        collectExternalClientCommands(srcRoot, pluginName, loaded, seen);
+                    }
+                    status = "ok plugins=" + pluginCount + " commands=" + loaded.size();
+                }
+            }
+        }catch(Throwable t){
+            Log.err("Failed to reload external help registry.");
+            Log.err(t);
+            loaded.clear();
+            status = "error";
+        }
+
+        synchronized(externalHelpButtons){
+            externalHelpButtons.clear();
+            externalHelpButtons.addAll(loaded);
+        }
+        externalCommandRegistryStatus = status;
+    }
+
+    private String loadPluginDisplayName(Fi pluginDir){
+        String fallback = pluginDir == null ? "plugin" : pluginDir.name();
+        if(pluginDir == null){
+            return fallback;
+        }
+
+        Fi pluginJson = pluginDir.child("plugin.json");
+        if(!pluginJson.exists()){
+            return fallback;
+        }
+
+        try{
+            Matcher matcher = JSON_NAME_PATTERN.matcher(pluginJson.readString("UTF-8"));
+            if(matcher.find()){
+                String value = unescapeJavaString(matcher.group(1)).trim();
+                if(!value.isEmpty()){
+                    return value;
+                }
+            }
+        }catch(Throwable ignored){
+        }
+        return fallback;
+    }
+
+    private void collectExternalClientCommands(Fi srcRoot, String pluginName, List<HelpCommandButton> output, Set<String> seen){
+        for(Fi file : srcRoot.findAll(value -> value != null && "java".equalsIgnoreCase(value.extension()))){
+            try{
+                String raw = file.readString("UTF-8");
+                Matcher usageMatcher = REGISTER_WITH_USAGE_PATTERN.matcher(raw);
+                while(usageMatcher.find()){
+                    String command = unescapeJavaString(usageMatcher.group(1)).trim();
+                    if(command.isEmpty() || !seen.add(command.toLowerCase(Locale.ROOT))){
+                        continue;
+                    }
+                    output.add(createExternalHelpButton(
+                        command,
+                        unescapeJavaString(usageMatcher.group(2)).trim(),
+                        unescapeJavaString(usageMatcher.group(3)).trim(),
+                        pluginName
+                    ));
+                }
+
+                Matcher noUsageMatcher = REGISTER_NO_USAGE_PATTERN.matcher(raw);
+                while(noUsageMatcher.find()){
+                    String command = unescapeJavaString(noUsageMatcher.group(1)).trim();
+                    if(command.isEmpty() || !seen.add(command.toLowerCase(Locale.ROOT))){
+                        continue;
+                    }
+                    output.add(createExternalHelpButton(
+                        command,
+                        "",
+                        unescapeJavaString(noUsageMatcher.group(2)).trim(),
+                        pluginName
+                    ));
+                }
+            }catch(Throwable ignored){
+            }
+        }
+    }
+
+    private String unescapeJavaString(String raw){
+        if(raw == null || raw.isEmpty()){
+            return "";
+        }
+
+        StringBuilder builder = new StringBuilder(raw.length());
+        for(int index = 0; index < raw.length(); index++){
+            char current = raw.charAt(index);
+            if(current != '\\' || index + 1 >= raw.length()){
+                builder.append(current);
+                continue;
+            }
+
+            char next = raw.charAt(++index);
+            switch(next){
+                case 'n':
+                    builder.append('\n');
+                    break;
+                case 'r':
+                    builder.append('\r');
+                    break;
+                case 't':
+                    builder.append('\t');
+                    break;
+                case '"':
+                    builder.append('"');
+                    break;
+                case '\\':
+                    builder.append('\\');
+                    break;
+                default:
+                    builder.append(next);
+                    break;
+            }
+        }
+        return builder.toString();
+    }
+
+    private ExternalVoteSession getExternalVoteSession(){
+        try{
+            Class<?> pluginClass = Class.forName("com.mdt.vote.VoteDependencyPlugin");
+            Object api = pluginClass.getMethod("getApi").invoke(null);
+            if(api == null){
+                return null;
+            }
+
+            Object snapshot = api.getClass().getMethod("getActiveSession").invoke(api);
+            if(snapshot == null){
+                return null;
+            }
+
+            ExternalVoteSession session = new ExternalVoteSession();
+            session.api = api;
+            session.sessionId = stringValue(snapshot.getClass().getMethod("getSessionId").invoke(snapshot));
+            session.title = stringValue(snapshot.getClass().getMethod("getTitle").invoke(snapshot));
+            session.description = stringValue(snapshot.getClass().getMethod("getDescription").invoke(snapshot));
+            session.yesCount = intValue(snapshot.getClass().getMethod("getYesCount").invoke(snapshot));
+            session.noCount = intValue(snapshot.getClass().getMethod("getNoCount").invoke(snapshot));
+            session.requiredYesCount = intValue(snapshot.getClass().getMethod("getRequiredYesCount").invoke(snapshot));
+            session.remainingSeconds = longValue(snapshot.getClass().getMethod("getRemainingSeconds").invoke(snapshot));
+            return session;
+        }catch(Throwable ignored){
+            return null;
+        }
+    }
+
+    private void castExternalVote(Player player, byte choice, ExternalVoteSession session){
+        if(player == null || session == null || session.api == null){
+            return;
+        }
+        if(choice == 0){
+            player.sendMessage("[scarlet]External vote does not support neutral vote.[]");
+            return;
+        }
+
+        try{
+            Object result = session.api.getClass().getMethod(
+                "castVote",
+                String.class,
+                String.class,
+                String.class,
+                boolean.class
+            ).invoke(session.api, session.sessionId, player.uuid(), player.plainName(), Boolean.valueOf(choice > 0));
+            boolean success = booleanValue(result.getClass().getMethod("isSuccess").invoke(result));
+            String message = stringValue(result.getClass().getMethod("getMessage").invoke(result));
+            player.sendMessage((success ? "[accent]" : "[scarlet]") + message + "[]");
+        }catch(Throwable t){
+            player.sendMessage("[scarlet]External vote bridge failed.[]");
+            Log.err(t);
+        }
+    }
+
+    private void showExternalVoteMenu(Player player, ExternalVoteSession session){
+        if(player == null || player.con == null || session == null){
+            return;
+        }
+
+        StringBuilder message = new StringBuilder();
+        message.append("[accent]").append(session.title).append("[]\n");
+        if(!session.description.isEmpty()){
+            message.append(session.description).append("\n");
+        }
+        message.append("[green]YES[] ").append(session.yesCount)
+            .append(" [scarlet]NO[] ").append(session.noCount)
+            .append(" [lightgray]Need[] ").append(session.requiredYesCount)
+            .append(" [lightgray]Remain[] ").append(session.remainingSeconds).append("s");
+
+        Call.menu(
+            player.con,
+            MAP_VOTE_PROMPT_MENU_ID,
+            "[accent]Vote[]",
+            message.toString(),
+            new String[][]{
+                {"YES", "NO", "Close"}
+            }
+        );
+    }
+
+    private String stringValue(Object value){
+        return value == null ? "" : String.valueOf(value).trim();
+    }
+
+    private int intValue(Object value){
+        return value instanceof Number ? ((Number)value).intValue() : 0;
+    }
+
+    private long longValue(Object value){
+        return value instanceof Number ? ((Number)value).longValue() : 0L;
+    }
+
+    private boolean booleanValue(Object value){
+        return Boolean.TRUE.equals(value);
+    }
+
     private String voteChoiceLabel(byte choice){
         if(choice > 0){
             return "[green]同意[]";
@@ -1314,16 +1676,51 @@ public class ServeMdtPlugin extends Plugin{
 
     private static class HelpCommandButton{
         final String label;
+        final String command;
+        final String args;
+        final String description;
+        final String source;
         final String runText;
         final String usageMessage;
         final HelpButtonAction action;
 
         HelpCommandButton(String label, String runText, String usageMessage, HelpButtonAction action){
+            this(label, extractCommand(runText), "", "", "", runText, usageMessage, action);
+        }
+
+        HelpCommandButton(String label, String command, String args, String description, String source, String runText, String usageMessage, HelpButtonAction action){
             this.label = label;
+            this.command = command == null ? "" : command;
+            this.args = args == null ? "" : args;
+            this.description = description == null ? "" : description;
+            this.source = source == null ? "" : source;
             this.runText = runText;
             this.usageMessage = usageMessage;
             this.action = action;
         }
+
+        private static String extractCommand(String runText){
+            if(runText == null){
+                return "";
+            }
+            String value = runText.trim();
+            if(value.startsWith("/")){
+                value = value.substring(1);
+            }
+            int split = value.indexOf(' ');
+            return split >= 0 ? value.substring(0, split) : value;
+        }
+    }
+
+    private static class ExternalVoteSession{
+        Object api;
+        String sessionId;
+        String title;
+        String description;
+        int yesCount;
+        int noCount;
+        int requiredYesCount;
+        long remainingSeconds;
     }
 
     private interface HelpButtonAction{
